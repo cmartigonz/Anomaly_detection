@@ -1,0 +1,1144 @@
+---
+title: "Practica Deteccion Anomalias"
+author: "Carlos Marti Gonzalez"
+date: "2024-03-15"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	error = FALSE,
+	warning = FALSE,
+	echo = TRUE
+)
+```
+
+```{r installation, eval=FALSE, include=FALSE}
+install.packages("tidyverse")
+install.packages("devtools")
+library(devtools)
+
+# ggbiplot:
+install_github("vqv/ggbiplot")  # Si pregunta, seleccione la opción 3.
+
+# El directorio en el que se instale no debe tener caracteres como acentos, ?, etc.
+# 
+# Si no funciona lo anterior, probar alguna de las siguientes:
+# devtools::install_github("richardjtelford/ggbiplot", ref = "experimental")
+# install_github("ggbiplot", "vqv")
+# install_github("vqv/ggbiplot", ref = "experimental")
+
+install.packages("fitdistrplus")  # Ajuste de una distribución
+install.packages("reshape")       # melt
+install.packages("outliers")      # Grubbs
+install.packages("CerioliOutlierDetection")  #MCD Hardin Rocke estimación robusta de la matriz de covarianzas
+install.packages("mvoutlier")     # corr.plot , MCD ChiC 
+install.packages("mvnormtest")    # mvn. Test Normalidad multivariante
+install.packages("MVN")           
+install.packages("DDoutlier")     # lof
+install.packages("cluster")       # pam
+```
+
+```{r library, include=FALSE}
+library(ggplot2)   # Gráficos
+library(fitdistrplus)  # Ajuste de una distribución -> denscomp 
+library(reshape)   # melt
+library(ggbiplot)  # biplot
+library(tidyverse)   
+library(outliers)  # Grubbs
+library(MVN)       # mvn: Test de normalidad multivariante  
+library(CerioliOutlierDetection)  #MCD Hardin Rocke
+library(mvoutlier) # corr.plot 
+library(DDoutlier) # lof
+library(cluster)   # PAM
+library(mlbench)
+
+```
+
+```{r auxiliares, include=FALSE}
+plot_2_colores = function (datos, 
+                           claves.a.mostrar, 
+                           titulo = "",
+                           colores = c("black", "red")){
+  
+  num.datos = nrow(as.matrix(datos))
+  seleccionados =  rep(FALSE, num.datos)
+  seleccionados[claves.a.mostrar] = TRUE
+  colores.a.mostrar = rep(colores[1], num.datos)
+  colores.a.mostrar [seleccionados] = colores[2]
+  
+  plot(datos, col=colores.a.mostrar, main = titulo)
+}
+
+
+
+###########################################################################
+# Función análoga a son_outliers_IQR, salvo que devuelve un vector
+# de claves en vez de un vector de bools
+
+claves_outliers_IQR = function(datos, ind.columna, coef = 1.5){
+  columna.datos = datos[,ind.columna]
+  son.outliers.IQR = son_outliers_IQR(datos, ind.columna, coef)
+  return (which(son.outliers.IQR  == TRUE))
+}
+
+
+
+###########################################################################
+# Calcula los outliers IQR con respecto a una columna 
+# Devuelve un vector de bools indicando si el registro i-ésimo 
+# de datos es o no un outlier IQR con respecto a la columna ind.columna
+# coef es 1.5 para los outliers normales y hay que pasarle 3 para los outliers extremos
+
+son_outliers_IQR = function (datos, ind.columna, coef = 1.5){
+  columna.datos = datos[,ind.columna]
+  cuartil.primero = quantile(columna.datos)[2]  
+  #quantile[1] es el mínimo y quantile[5] el máximo.
+  cuartil.tercero = quantile(columna.datos)[4] 
+  iqr = cuartil.tercero - cuartil.primero
+  extremo.superior.outlier = (iqr * coef) + cuartil.tercero
+  extremo.inferior.outlier = cuartil.primero - (iqr * coef)
+  son.outliers.IQR  = columna.datos > extremo.superior.outlier |
+    columna.datos < extremo.inferior.outlier
+  return (son.outliers.IQR)
+}
+
+
+###########################################################################
+# Calcula los outliers IQR con respecto a ALGUNA columna
+# Devuelve un vector de claves indicando si el registro i-ésimo 
+# de datos es o no un outlier IQR con respecto a ALGUNA columna
+# coef es 1.5 para los outliers normales y  3 para los outliers extremos
+
+claves_outliers_IQR_en_alguna_columna = function(datos, coef = 1.5){
+  df.clave.columnas = data.frame()
+  claves.outliers =  sapply(1:ncol(datos), 
+                               function(x) claves_outliers_IQR(datos, x, coef)
+  )
+  claves.outliers.en.alguna.columna = unlist(claves.outliers)
+  return (claves.outliers.en.alguna.columna)
+}
+
+
+
+
+#######################################################################
+# Devuelve los nombres de aquellas filas especificadas en el parámetro claves
+# filas es un vector de bools 
+
+nombres_filas = function (datos, claves) {
+  num.claves = length(claves)
+  nombres.filas = row.names(as.data.frame(datos))[claves]
+  
+  return (nombres.filas)
+}
+
+
+
+
+#######################################################################
+# función base para diag_caja_outliers_IQR y diag_caja
+
+diag_caja_grafico_base = function(datos, indice.columna){
+  # Importante: Para que aes busque los parámetros en el ámbito local, 
+  # debe incluirse  environment = environment()
+  nombre.columna = colnames(datos)[indice.columna]
+  ggboxplot = ggplot(data = as.data.frame(datos), 
+                     aes(x=factor(""), 
+                         y = datos[,indice.columna]) , 
+                     environment = environment()) + 
+              xlab(nombre.columna) + ylab("") 
+  return (ggboxplot)
+}
+
+#######################################################################
+# Muestra un diagrama de caja
+# Calcula los outliers IQR y los muestra como puntos en rojo en un BoxPlot
+
+diag_caja_outliers_IQR = function (datos, ind.columna, coef.IQR = 1.5){
+  # Si quisiéramos líneas horizontales en los límites de las cajas
+  # habría que añadir 
+  # + stat_boxplot(geom = 'errorbar')   
+  
+   outliers.IQR = son_outliers_IQR(datos, ind.columna, coef = coef.IQR)
+   ggboxplot =  diag_caja_grafico_base(datos, ind.columna) + 
+                stat_boxplot(coef = coef.IQR) +
+                geom_boxplot(coef = coef.IQR, outlier.colour = "red") 
+                # Importante: geom_boxplot debe ir después de stat_boxplot
+   
+   return (ggboxplot)
+}
+
+
+
+#######################################################################
+# Muestra un diagrama de caja
+# También muestra las etiquetas de los registros indicados en 
+# el parámetro claves.a.mostrar 
+
+diag_caja = function (datos, ind.columna, claves.a.mostrar = c()){
+  num.filas = nrow(datos)
+  num.claves = length(claves.a.mostrar)
+  nombres.filas = vector (mode = "character", length = num.filas)
+  nombres.filas = rep("", num.filas)
+  nombres.claves = nombres_filas(datos, claves.a.mostrar)
+  
+  for (i in 1:num.claves)
+    nombres.filas[claves.a.mostrar[i]]  = nombres.claves[i]
+  
+  ggboxplot = diag_caja_grafico_base(datos, ind.columna) + 
+    geom_boxplot(outlier.shape = NA) + # Para que no imprima los outliers IQR calculados dentro del mismo geom_boxplot
+    geom_text(aes(label = nombres.filas)) 
+  
+  return (ggboxplot)
+}
+
+
+
+
+
+#######################################################################
+# Muestra de forma conjunta todos los diagramas de caja de las variables de datos
+# Para ello, normaliza previamente los datos.
+# También muestra las etiquetas de los registros indicados en claves.a.mostrar
+# Requiere reshape
+
+diag_caja_juntos = function (datos, titulo = "", claves.a.mostrar = c()){  
+  # Importante: Para que aes busque los parámetros en el ámbito local, 
+  # debe incluirse  environment = environment()
+  
+  # Para hacerlo con ggplot, lamentablemente hay que construir antes una tabla 
+  # que contenga en cada fila el valor que a cada tupla le da cada variable 
+  # -> paquete reshape->melt
+  
+  # Por ejemplo, si tenemos el siguiente data frame
+  
+  # datos = data.frame(
+  #   A = c(1, 2),
+  #   B = c(3, 4)
+  # )
+  # datos =
+  #     A  B
+  #     1  3
+  #     2  4
+  
+  # melt(datos) construye esta tabla:
+  
+  #      variable value
+  # 1        A     1
+  # 2        A     2
+  # 3        B     3
+  # 4        B     4
+  
+  
+  nombres.de.filas = nombres_filas (datos, claves.a.mostrar)
+  
+  datos = scale(datos)
+  datos.melted = melt(datos)
+  colnames(datos.melted)[2]="Variables"
+  colnames(datos.melted)[3]="zscore"
+  factor.melted = colnames(datos.melted)[1]
+  columna.factor = as.factor(datos.melted[,factor.melted])
+  levels(columna.factor)[!levels(columna.factor) %in% nombres.de.filas] = ""  
+  
+  ggplot(data = datos.melted, 
+         aes(x=Variables, y=zscore), 
+         environment = environment()) + 
+    ggtitle(titulo) + 
+    geom_boxplot(outlier.shape = NA) + 
+    geom_text(aes(label = columna.factor), size = 3) 
+}
+
+
+
+
+
+
+#######################################################################
+# Muestra un biplot del conjunto de datos
+# Se muestran los nombres de los registros indicados en claves.a.mostrar
+# El color usado para dichos registros es el segundo del parámetro colores
+# El título para el grupo de dichos registros es el especificado en titulo.grupo.a.mostrar
+# El parámetro titulo especifica el título principal del gráfico
+
+biplot_2_colores = function (datos, 
+                             claves.a.mostrar = c(), 
+                             titulo = "",
+                             titulo.grupo.a.mostrar = "Outliers",
+                             colores = c("black","red")){
+  nombres = rownames(datos)
+  claves.datos = c(1:nrow(datos))
+  son.a.mostrar = claves.datos %in% claves.a.mostrar
+  nombres[!son.a.mostrar] = ''
+
+  PCA.model = princomp(scale(datos))
+  outlier.shapes = c(".","x") 
+  biplot = ggbiplot(PCA.model,
+                    obs.scale = 1,
+                    var.scale = 1 ,
+                    varname.size = 5,
+                    groups =  son.a.mostrar,
+                    alpha = 1/2) #alpha = 1/10
+  biplot = biplot + labs(color = titulo.grupo.a.mostrar)
+  biplot = biplot + scale_color_manual(values = colores)
+  biplot = biplot + geom_text(label = nombres,
+                              stat = "identity",
+                              size = 3,
+                              hjust=0,
+                              vjust=0)
+  biplot = biplot + ggtitle(titulo)
+}
+
+
+
+#######################################################################
+# Muestra un biplot de un conjunto de datos diferenciados por color
+# El color lo determina la asignación de cada dato a un cluster 
+# Las asignaciones de datos a cluster se indican en asignaciones.clustering
+# También se muestran los outliers cuyas claves vienen indicadas en claves.outliers
+ 
+biplot_outliers_clustering = function(datos, 
+                                      titulo = "Outliers por el método de Clustering", 
+                                      titulo.color = "Asignaciones Clustering",
+                                      titulo.outlier = "Outliers",
+                                      asignaciones.clustering,
+                                      claves.outliers){
+  son.outliers = rep(FALSE, nrow(datos))
+  son.outliers[claves.outliers] = TRUE
+  
+  bip = biplot_colores_formas(datos, 
+                              titulo, titulo.color, titulo.outlier,
+                              asignaciones.clustering,
+                              son.outliers,
+                              claves.outliers)
+  bip 
+}
+
+#######################################################################
+# Muestra un biplot del conjunto de datos
+# Los datos se muestran diferenciados por color y por forma
+# Las asignaciones de cada dato a su color y forma vienen dadas por los vectores
+# asignaciones.colores y asignaciones.formas 
+# También se muestran las etiquetas de los registros indicados
+# en el parámetro opcional claves.a.mostrar 
+
+biplot_colores_formas = function (datos, 
+                                  titulo, titulo.color = '', titulo.forma = '', 
+                                  asignaciones.colores, asignaciones.formas,
+                                  claves.a.mostrar = c()){
+  PCA.model = princomp(scale(datos))
+  
+  son.a.mostrar = rep(FALSE, nrow(datos))
+  son.a.mostrar[claves.a.mostrar] = TRUE
+  nombres.a.mostrar = rownames(datos)
+  nombres.a.mostrar[!son.a.mostrar] = ''
+
+  asignaciones.colores = factor(asignaciones.colores)
+  asignaciones.formas  = factor(asignaciones.formas)
+
+  
+  bip = ggbiplot(PCA.model, obs.scale = 1, var.scale=1 , varname.size = 3, alpha = 0) +              
+    geom_point(aes(shape = asignaciones.formas, colour = asignaciones.colores))  +
+    labs(shape = titulo.forma) +
+    labs(colour = titulo.color) +
+    ggtitle(titulo) +
+    geom_text(label = nombres.a.mostrar, stat = "identity", size = 3, hjust=0, vjust=0)      
+  
+  bip
+}
+
+#######################################################################
+# Calcula las distancias de cada dato al centroide de su cluster
+# Las asignaciones de cada dato a su cluster se indican en asignaciones.clustering
+# Cada centroide es una fila del data frame datos.centroides.normalizados
+
+distancias_a_centroides = function (datos.normalizados, 
+                                    asignaciones.clustering, 
+                                    datos.centroides.normalizados){
+  
+  sqrt(rowSums(   (datos.normalizados 
+                   - 
+                   datos.centroides.normalizados[asignaciones.clustering,])^2  ))
+}
+
+
+#######################################################################
+# Revierte la función de normalización (z-score)
+
+desnormaliza = function(datos, filas.normalizadas){
+  medias        = colMeans(datos)
+  desviaciones  = apply(datos, 2, sd , na.rm = TRUE)
+  
+  filas.desnormalizadas  = sweep(filas.normalizadas, 2, desviaciones, "*")
+  filas.desnormalizadas  = sweep(filas.desnormalizadas, 2, medias, "+")
+  
+  filas.desnormalizadas 
+}
+
+
+
+
+top_clustering_outliers = function(datos.norm, 
+                                   asignaciones.clustering, 
+                                   datos.centroides.norm, 
+                                   num.outliers){
+  
+  dist_centroides = distancias_a_centroides (datos.norm, 
+                                             asignaciones.clustering, 
+                                             datos.centroides.norm)
+  
+  claves = order(dist_centroides, decreasing=T)[1:num.outliers]
+  
+  list(distancias = dist_centroides[claves]  , claves = claves)
+}
+
+
+
+```
+
+# Dataset y Selección de Variables
+
+Para este trabajo, se ha elegido el **Pima Indians Data Set**. Este conjunto de datos representa los resultados de pruebas de diabetes recopilados por el Instituto Nacional de Diabetes y Enfermedades Digestivas y Renales de los EE. UU., enfocados en una población de mujeres de al menos 21 años de edad, de herencia india Pima, que viven cerca de Phoenix, Arizona. Los datos provienen directamente del estudio PimaIndiansDiabetes2.
+
+A continuación, se describen en detalle las variables incluidas en el conjunto de datos:
+
+-   **pregnant:** Representa el número de veces que la participante ha estado embarazada. Esta variable es un indicador importante ya que el embarazo puede influir en la sensibilidad a la insulina y está asociado con cambios en el metabolismo de la glucosa.
+
+-   **glucose:** Concentración de glucosa plasmática medida durante una prueba de tolerancia a la glucosa. Esta prueba implica un ayuno seguido de la ingesta de una solución glucosada, con mediciones de glucosa en la sangre en intervalos específicos. Es un indicador crítico de la capacidad del cuerpo para procesar la glucosa.
+
+-   **pressure:** Presión arterial diastólica medida en mm Hg. La presión diastólica es el valor más bajo de presión arterial, observado cuando el corazón está en reposo entre latidos. La hipertensión es un factor de riesgo conocido para la diabetes.
+
+-   **triceps:** Espesor del pliegue cutáneo del tríceps medido en mm. Esta medida se utiliza como un indicador de la grasa corporal.
+
+-   **insulin:** Concentración de insulina sérica 2 horas después de la ingestión de glucosa, medida en mu U/ml. La insulina es una hormona crucial que ayuda a controlar los niveles de glucosa en la sangre. Niveles anormales pueden indicar resistencia a la insulina o una deficiencia en la producción de insulina, ambos factores relacionados con la diabetes.
+
+-   **mass**: Índice de masa corporal (IMC), calculado como el peso en kilogramos dividido por el cuadrado de la altura en metros. El IMC es un indicador de obesidad, que es un factor de riesgo significativo para la diabetes.
+
+-   **pedigree:** Función del pedigrí de diabetes. Este valor cuantitativo refleja la influencia genética y familiar en la probabilidad de desarrollar diabetes, basado en la historia familiar de la enfermedad.
+
+-   **age:** Edad de la participante, medida en años. El riesgo de desarrollar diabetes tipo 2 aumenta con la edad.
+
+-   **diabetes:** Variable categórica que indica el resultado de la prueba de diabetes (negativo/positivo). Esta es la variable objetivo que se pretende predecir basándose en las otras variables del conjunto de datos.
+
+En este caso, todas las variables que existen en el dataset son numéricas, exceptuando la variable predictora que es categorica.
+
+```{r data, echo=FALSE}
+data(PimaIndiansDiabetes2)
+
+head(PimaIndiansDiabetes2)
+
+```
+
+```{r echo=FALSE}
+columnas.num = sapply(c(1:ncol(PimaIndiansDiabetes2)) , function(x) is.numeric(PimaIndiansDiabetes2[, x]))
+columnas.num
+
+PimaIndiansDiabetes2.num = PimaIndiansDiabetes2[, columnas.num]
+```
+
+```{r echo=FALSE}
+head(PimaIndiansDiabetes2.num)
+```
+
+Observamos si algunas de las variables tienen pocos valores de variables diferentes, concluyendo con que tienen bastante valores y nos quedamos con todas las variables.
+
+```{r echo=FALSE}
+
+# Calcular el número de valores únicos por columna
+n_unique <- sapply(PimaIndiansDiabetes2.num, function(x) length(unique(x)))
+
+# Imprimir el número de valores únicos por columna
+print(n_unique)
+```
+
+Y posteriormente, se eliminan las filas que contengan en algunos de las variables *`NA`*. Quedándonos de las 768 filas iniciales a 392 que contienen datos en todas las variables.
+
+```{r echo=FALSE}
+# Usando na.omit
+PimaIndiansDiabetes2.num <- na.omit(PimaIndiansDiabetes2.num)
+
+# Mostrar el resultado
+print(PimaIndiansDiabetes2.num)
+```
+
+# Detección de outliers en una dimensión
+
+## **Outliers IQR**
+
+Ahora se va a analizar el histograma de estas variables, para que confirmar que el método IQR se pueda aplicar de manera correcta.
+
+```{r echo=TRUE}
+par(mfrow=c(2,4), mar=c(4, 4, 4, 1)) # Ajustes para los histogramas
+
+# Usar sapply para aplicar hist a cada variable
+sapply(1:ncol(PimaIndiansDiabetes2.num), function(x) {
+  hist(PimaIndiansDiabetes2.num[,x], main="", xlab=names(PimaIndiansDiabetes2.num[x]), ylab="Frecuencia")
+})
+
+```
+
+Como se puede observar, no hay nignuna que tenga una distribución con picos. La mayoría siguen una distribución normal, pero hay algunas que se asemejan más a una exponencial, pero nada raro, por lo que podemos mantener nuestras variables para el estudio.
+
+En este punto si que vamos a guardar cualquiera de las variables para trabajar sobre ella (aunque posteriormente se trabajará sobre todas). En este caso, una de las que más se puede decir que siguen la Normal seria la de `mass`. Existen otras como son `pressure`, `triceps` o `glucose` que también se asemejan bastante.
+
+```{r column, echo=FALSE}
+indice.columna = 6
+columna        = PimaIndiansDiabetes2.num[, indice.columna]
+nombre.columna = names(PimaIndiansDiabetes2.num) [indice.columna]
+```
+
+### **Obtención de los outliers IQR**
+
+En relación a la obtención de los outliers IQR y su cálculo, aqui se va a definir parte por parte las acciones a realizar, obteniendo el resultado siguiente:
+
+```{r echo=TRUE}
+#Calculamos los cuartiles
+cuartil.primero <- quantile(columna, 0.25)
+cuartil.tercero <- quantile(columna, 0.75)
+iqr <- IQR(columna)
+
+#Calculamos los valores extremos para los outliers
+extremo.superior.outlier.IQR <- cuartil.tercero + 1.5 * iqr
+extremo.inferior.outlier.IQR <- cuartil.primero - 1.5 * iqr
+extremo.superior.outlier.IQR.extremo <- cuartil.tercero + 3 * iqr
+extremo.inferior.outlier.IQR.extremo <- cuartil.primero - 3 * iqr
+
+
+#Se construyen los vectores identificando los outliers
+son.outliers.IQR <- columna > extremo.superior.outlier.IQR | columna < extremo.inferior.outlier.IQR
+son.outliers.IQR.extremos <- columna > extremo.superior.outlier.IQR.extremo | columna < extremo.inferior.outlier.IQR.extremo
+```
+
+```{r echo=FALSE}
+indice.columna
+
+nombre.columna
+
+cuartil.primero
+
+cuartil.tercero
+
+iqr
+
+extremo.superior.outlier.IQR 
+
+extremo.inferior.outlier.IQR
+
+extremo.superior.outlier.IQR.extremo
+
+extremo.inferior.outlier.IQR.extremo 
+
+head(son.outliers.IQR)
+
+sum(son.outliers.IQR)
+
+head(son.outliers.IQR.extremos)
+
+sum(son.outliers.IQR.extremos)
+```
+
+Los resultados obtenidos del cálculo de extremos IQR para la columna "mass" muestran varios aspectos interesantes sobre la distribución de los datos y la presencia de valores atípicos (outliers).
+
+En cuanto a los cuartiles, se puede observar como nos dan una idea de cómo están distribuidos los datos, con una concentración de valores entre **28.4** (`cuartil.primero`) y **37.1** (`cuartil.tercero`). Además, un `IQR` de 8.7 indica una variabilidad moderada en los valores centrales de la distribución de `mass`.
+
+Por otro lado, en cuanto a los valores atipicos extremos, se observa que valores por encima de **50.15** (`extremo.superior.outlier.IQR`) y por debajo de **15.35** (`extremo.inferior.outlier.IQR`) pueden considerarse valores atípicos o extremos, donde el umbral para identificar los outliers extremos superiores sería el de **63.2** (`extremo.superior.outlier.IQR.extremos`) y el umbral inferior sería **2.3** (`extremo.inferior.outlier.IQR.extremos`).
+
+Finalmente, en cuanto a la presencia de 6 (`son.outliers.IQR`) outliers IQR y 1 (`son.outliers.IQR.extremos`) outlier extremo sugiere que la mayoría de los datos en la columna elegida están relativamente agrupados, con algunos valores alejándose significativamente de la tendencia central.
+
+### **Índices y valores de los outliers IQR**
+
+En lo siguiente, se va a obtener los índices de las filas que contienen los outliers de la columna seleccionada `mass`. Para ello, se han utlizado los cálculos realizados antes creando nuevas estructuras.
+
+```{r echo=TRUE}
+#Indices de Outliers IQR
+claves.outliers.IQR <- which(son.outliers.IQR)
+
+#dataframe Outliers IQR
+df.outliers.IQR <- PimaIndiansDiabetes2.num[son.outliers.IQR, ]
+
+#Nombres de fila
+nombres.outliers.IQR <- row.names(df.outliers.IQR)
+
+#Valores outliers IQR
+valores.outliers.IQR <- df.outliers.IQR
+
+#Indices de Outliers IQR Extremos
+claves.outliers.IQR.extremos <- which(son.outliers.IQR.extremos)
+
+#dataframe Outliers IQR Extremos
+df.outliers.IQR.extremos <- PimaIndiansDiabetes2.num[son.outliers.IQR.extremos, ]
+
+#Nombres de fila Extremos
+nombres.outliers.IQR.extremos <- row.names(df.outliers.IQR.extremos)
+
+#Valores outliers IQR Extremos
+valores.outliers.IQR.extremos <- df.outliers.IQR.extremos$mass
+
+
+```
+
+```{r echo=FALSE}
+claves.outliers.IQR
+## [1]  56  58  87 120 226 349
+
+df.outliers.IQR
+##pregnant glucose pressure triceps insulin mass pedigree age
+##121	0	     162	    76	    56	    100	  53.2	0.759	  25
+##126	1	     88	      30	    42	     99	  55.0	0.496	  26
+##178	0	     129	    110	    46	    130	  67.1	0.319	  26
+##248	0	     165	    90	    33	    680	  52.3	0.427	  23
+##446	0	     180	    78	    63	     14	  59.4	2.420	  25
+##674	3	     123	    100	    35	    240	  57.3	0.880	  22
+
+
+nombres.outliers.IQR
+## [1] "121" "126" "178" "248" "446" "674"
+
+valores.outliers.IQR
+##pregnant glucose pressure triceps insulin mass pedigree age
+##121	0	     162	    76	    56	    100	  53.2	0.759	  25
+##126	1	     88	      30	    42	     99	  55.0	0.496	  26
+##178	0	     129	    110	    46	    130	  67.1	0.319	  26
+##248	0	     165	    90	    33	    680	  52.3	0.427	  23
+##446	0	     180	    78	    63	     14	  59.4	2.420	  25
+##674	3	     123	    100	    35	    240	  57.3	0.880	  22
+
+claves.outliers.IQR.extremos
+## [1] 87
+
+df.outliers.IQR.extremos
+## pregnant glucose pressure triceps insulin mass pedigree age
+##178	0	      129	    110	     46	      130	  67.1	0.319	  26
+
+
+nombres.outliers.IQR.extremos
+## [1] "178"
+
+valores.outliers.IQR.extremos
+## [1] 67.1
+```
+
+Los resultados muestran las mismas conclusiones que se habían sacado anteriormente, pero obteniendo las filas del dataset original.
+
+### **Cómputo de los outliers IQR con funciones**
+
+
+```{r}
+son.outliers.IQR = son_outliers_IQR (PimaIndiansDiabetes2.num, indice.columna)
+head(son.outliers.IQR)
+
+claves.outliers.IQR = claves_outliers_IQR (PimaIndiansDiabetes2.num, indice.columna)
+claves.outliers.IQR
+
+son.outliers.IQR.extremos = son_outliers_IQR (PimaIndiansDiabetes2.num, indice.columna, 3)
+head(son.outliers.IQR.extremos)
+
+claves.outliers.IQR.extremos = claves_outliers_IQR (PimaIndiansDiabetes2.num, indice.columna, 3)
+claves.outliers.IQR.extremos
+```
+Observamos que usando las funciones se obtienen los mismos resultados que en las anteriores.
+
+### **Desviación de los outliers con respecto a la media de la columna**
+
+Ahora, se va a realizar una normalización de los datos en base a la columna seleccionada.. La normalización se realiza a través de la función scale(), que ajusta los datos para que tengan una media de 0 y una desviación estándar de 1, convirtiéndolos en una distribución normal estándar N(0,1). Este proceso es muy importante para comparar directamente variables que pueden tener diferentes unidades de medida o rangos de valores.
+
+```{r echo=FALSE}
+PimaIndiansDiabetes2.num.norm = scale(PimaIndiansDiabetes2.num)
+head(PimaIndiansDiabetes2.num.norm)
+
+columna.norm = PimaIndiansDiabetes2.num.norm[, indice.columna]
+```
+
+Al aplicar el análisis de z-score a la variable `mass` tras su normalización, podemos evaluar cómo se distribuyen sus valores en el contexto de una distribución normal estándar. Con esto, observamos variaciones significativas en algunas variables, como `insulin` y `pedigree`, donde algunos valores están notablemente alejados de 0, indicando registros atípicos o con características muy distintas a las del promedio. Especialmente notable es el valor **5.1086** en `pedigree`, que sugiere un caso extremadamente inusual en términos de predisposición genética a la diabetes.
+
+```{r}
+valores.outliers.IQR.norm <- columna.norm[son.outliers.IQR]
+
+```
+
+```{r echo=FALSE}
+valores.outliers.IQR.norm
+```
+
+En el caso de `mass`, los valores normalizados muestran claramente cuáles son considerados inusuales en el contexto de su distribución en el conjunto de datos. Por ejemplo, los valores normalizados para los outliers identificados están en el rango de **2.734022** a **4.839986**, indicando que estos valores están significativamente desviados del promedio. Comparando estos valores normalizados con los originales **(53.2, 55.0, 67.1, 52.3, 59.4, 57.3)**, podemos apreciar la utilidad del `z-score` para identificar outliers de manera más intuitiva, transformando todas las variables a una escala común que facilita el análisis preliminar de los datos.
+
+```{r}
+PimaIndiansDiabetes2.num.norm.outliers.IQR <- PimaIndiansDiabetes2.num.norm[claves.outliers.IQR, ]
+```
+
+```{r echo=FALSE}
+PimaIndiansDiabetes2.num.norm.outliers.IQR
+
+```
+
+Podemos observar que en algunas de las otras columnas, si que tienen valores similares a los de mass, como puede ser `insulin`, `triceps` o `pressure`. Con ello, podemos observar que en estas variables también serán variables donde aparecerán outliers.
+
+### **Gráfico**
+
+En estos gráficos, podemos observar cómo se distribuyen los datos normalizados. Se pueden ver cómo los datos que hemos ido analizando se representan y, efectivamente se ve que son valores atípicos y extremos.
+
+```{r}
+
+plot_2_colores(PimaIndiansDiabetes2.num.norm[, "mass"], 
+               claves.outliers.IQR, 
+               "Distribución de 'mass' Normalizada con Outlier")
+
+```
+
+```{r}
+
+plot_2_colores(PimaIndiansDiabetes2.num.norm[, "mass"], 
+               claves.outliers.IQR.extremos, 
+               "Distribución de 'mass' Normalizada con Outlier extremos")
+```
+
+### **Diagramas de cajas**
+
+Ahora vamos a obtener los diagramas de cajas de estos mismos outliers para la columna `mass`, ya que es otra manera de visualización, importante para poder visualizar y entender por qué son valores atípicos.
+
+Como se puede observar, los outliers se ven en rojo fuera de los valores normales. En este caso se ha usado los datos normalizados.
+
+```{r}
+diag_caja_outliers_IQR(PimaIndiansDiabetes2.num.norm, indice.columna)
+```
+
+Es verdad que en esta gráfica, no aparecen las etiquetas de los diferentes valores atípicos. Para ello hacemos lo siguiente para poder mostrarlas. Aquí,podemos observar a cuál se refiere y aunque en este punto son solo números, pero ayuda a saber cuales son.
+
+```{r}
+diag_caja(PimaIndiansDiabetes2.num.norm, indice.columna, claves.outliers.IQR)
+```
+
+En cuanto a los valores extremos, también se pueden visualizar de esta manera. Observando el valor extremo que se encuentra.
+
+```{r}
+diag_caja_outliers_IQR(PimaIndiansDiabetes2.num.norm, indice.columna, coef=3)
+
+```
+
+```{r}
+diag_caja(PimaIndiansDiabetes2.num.norm, indice.columna, claves.outliers.IQR.extremos)
+
+```
+
+Ahora, vamos a observar la relación de la distribución del resto de variables con respecto a la columna `mass` seleccionada. Esto. ayuda a contextualizar al dato y ver si existe algún tipo de correlación entre los valores atípicos asociados a esta variable, con respecto a las demás de la fila. Para ello, vamos a generar el diagrama de cajas conjunto.
+
+```{r}
+diag_caja_juntos(PimaIndiansDiabetes2.num, "Outliers en alguna columna", claves.outliers.IQR)
+```
+
+Como se observó anteriormente, algunos de los outliers detectados con respecto a `mass`, son outliers con respecto a otras variables como pueden ser `insulin`, `triceps`, `pedigree` o `pressure`. Esta es una visualización más sencilla e intuitiva para ver si estos mismos outliers lo serían con respecto a otras columnas.
+
+## **Trabajando con varias columnas**
+
+Ahora, se va a aplicar los procesos de detección de outliers, pero en vez de a una específica, se va a analizar todo el conjunto de datos.
+
+### **Outliers IQR**
+
+En primer lugar, obtenemos los outliers IQR de los datos. Aquí podemos observar como existen varios que están duplicados por lo que habría que eliminarlos ya que puede ser que un mismo registro aparezca outlier por varias variables, como hemos podido observar con el primer análisis.
+
+```{r echo=FALSE}
+claves.outliers.IQR.en.alguna.columna = claves_outliers_IQR_en_alguna_columna(PimaIndiansDiabetes2.num, 1.5)
+
+claves.outliers.IQR.en.alguna.columna
+
+```
+
+```{r echo=FALSE}
+claves.outliers.IQR.en.mas.de.una.columna = 
+  unique(claves.outliers.IQR.en.alguna.columna[duplicated(claves.outliers.IQR.en.alguna.columna)])
+claves.outliers.IQR.en.alguna.columna = unique (claves.outliers.IQR.en.alguna.columna)
+
+claves.outliers.IQR.en.mas.de.una.columna
+
+claves.outliers.IQR.en.alguna.columna 
+
+nombres_filas(PimaIndiansDiabetes2.num, claves.outliers.IQR.en.mas.de.una.columna)
+
+nombres_filas(PimaIndiansDiabetes2.num, claves.outliers.IQR.en.alguna.columna)
+
+```
+
+Con esto, se puede observar que existen 11 de los valores que estaban duplicados.
+
+También se calculan las claves de los IQR extremos:
+
+```{r}
+claves.outliers.IQR.extremos.en.alguna.columna = claves_outliers_IQR_en_alguna_columna(PimaIndiansDiabetes2.num, 3)
+
+claves.outliers.IQR.extremos.en.alguna.columna
+
+claves.outliers.IQR.extremos.en.mas.de.una.columna = 
+  unique(claves.outliers.IQR.extremos.en.alguna.columna[duplicated(claves.outliers.IQR.extremos.en.alguna.columna)])
+claves.outliers.IQR.extremos.en.alguna.columna = unique (claves.outliers.IQR.extremos.en.alguna.columna)
+
+claves.outliers.IQR.extremos.en.mas.de.una.columna
+
+claves.outliers.IQR.extremos.en.alguna.columna 
+
+nombres_filas(PimaIndiansDiabetes2.num, claves.outliers.IQR.extremos.en.mas.de.una.columna)
+
+nombres_filas(PimaIndiansDiabetes2.num, claves.outliers.IQR.extremos.en.alguna.columna)
+
+```
+
+Observando que existen 13 valores IQR extremos.
+
+Ahora, vamos a ver los datos obtenidos normalizados, para poder ver las gráficas correspondientes y analizar los valores atípicos.Para ello, solo nos quedamos con los únicos (`claves.outliers.IQR.en.alguna.columna`)
+
+```{r}
+PimaIndiansDiabetes2.num.norm.outliers.IQR.en.alguna.columna <- PimaIndiansDiabetes2.num.norm[claves.outliers.IQR.en.alguna.columna, ]
+
+PimaIndiansDiabetes2.num.norm.outliers.IQR.en.alguna.columna
+```
+
+Observando también la normalización de los extremos.
+
+```{r}
+PimaIndiansDiabetes2.num.norm.outliers.IQR.extremos.en.alguna.columna <- PimaIndiansDiabetes2.num.norm[claves.outliers.IQR.extremos.en.alguna.columna, ]
+
+PimaIndiansDiabetes2.num.norm.outliers.IQR.extremos.en.alguna.columna
+```
+
+Vamos a observar esto de manera gráfica con el diagrama de cajas de las variables para ver aquellos registros que son comunes con respecto a alguna columna, sabiendo que algunos lo son ya que se ha visto anteriormente.
+
+En cuanto a esta gráfica, se observa que algunas variables, como `insulin` y `mass`, presentan un número considerable de outliers, lo que indica una mayor variabilidad y posibles desviaciones extremas de la media. Estos puntos atípicos pueden representar variaciones naturales en la población o podrían ser indicativos de errores de medición o de entrada de datos que requieren verificación.
+
+La simetría en la distribución de algunas variables como `glucose` y `pressure` lo que sugiere es que existe menos variabilidad y desviaciones en relación con la mediana.
+
+```{r}
+diag_caja_juntos(PimaIndiansDiabetes2.num, "Outliers en alguna columna", claves.outliers.IQR.en.alguna.columna)
+```
+
+Por otro lado, en cuanto a los outliers extremos, son pocos, pero su presencia es notable en varias variables, con énfasis particular en la insulina, el IMC y pedigree, donde los puntos se extienden más allá del umbral común de un z-score de +-3. Estos valores extremos podrían ser señales de preocupaciones clínicas significativas o indicativos de errores de medición y deben ser examinados con precaución. En este caso, los datos al estar seleccionados para la predicción de diabetes, es posible que tengan una correlación alta entre esto y los positivos en diabetes.
+
+Es importante saber que el peso y la insulina son muy importantes a la hora de poder desarrollar diabetes. Además, la función pedigree, al dar mayor predisposición genética, tiene una correlación muy grande con los valores atípicos que aparezcan siendo casi con total seguridad indicadores de diabetes.
+
+En menor medida, pero también se observa como la edad puede influir en esta detección.
+
+```{r}
+diag_caja_juntos(PimaIndiansDiabetes2.num, "Outliers extremos en alguna columna", claves.outliers.IQR.extremos.en.alguna.columna)
+```
+
+# **Outliers Multivariantes**
+
+En este apartado, se va a proceder a encontrar los outliers multivariantes. Para ello, como hemos hecho en anteriores apartados, se va a visualizar los datos para poder detectarlos.
+
+## **Visualización de datos con un Biplot**
+
+En la primera figura, la referente a los outliers, podemos observar que hay un número significativo de outliers dispersos a lo largo de la primera componente principal, pero muchos se concentran cerca del centro en la segunda componente. Esto indica que estos outliers pueden tener valores atípicos en ciertas variables que tienen un fuerte peso en la PC1.
+
+En la segunda imagen, se enfoca en los outliers extremos donde se aprecia que parecen seguir un patrón similar al de la primera imagen, dispersándose principalmente a lo largo de la PC1. Sin embargo, también hay algunos puntos rojos cercanos al centro de la distribución en la PC2, lo que sugiere que, aunque son extremos, sus valores no son radicalmente diferentes en todas las variables del conjunto de datos.
+
+En ambos casos, el PC1 explica el **32.0%** de la varianza mientras que el PC2 explica el **19.6%**, sumando más del 50% de la varianza total entre las dos. Esto indica que estos dos componentes capturan una porción significativa de la información contenida en el conjunto de datos original.
+
+```{r echo=FALSE}
+biplot.outliers.IQR = biplot_2_colores(PimaIndiansDiabetes2.num, 
+                                       claves.outliers.IQR.en.alguna.columna, 
+                                       titulo.grupo.a.mostrar = "Outliers IQR",
+                                       titulo ="Biplot Outliers IQR")
+biplot.outliers.IQR
+```
+
+```{r echo=FALSE}
+biplot.outliers.IQR.extremos = biplot_2_colores(PimaIndiansDiabetes2.num, 
+                                       claves.outliers.IQR.extremos.en.alguna.columna, 
+                                       titulo.grupo.a.mostrar = "Outliers extremos IQR",
+                                       titulo ="Biplot Outliers extremos IQR")
+biplot.outliers.IQR.extremos 
+```
+
+## **Métodos basados en distancias: LOF**
+
+Por otro lado, también vamos a observar los métodos basados más en distancias con la finalidad de proporcionar una garantía estadística de que los valores outliers, lo son.
+
+Para ello, vamos a aplicar el método LOF, donde el número de vecinos será 5:
+
+```{r echo=FALSE}
+num.vecinos.lof = 10
+lof.scores = LOF(dataset = PimaIndiansDiabetes2.num.norm, k = num.vecinos.lof)
+```
+
+```{r}
+indices.ordenados = order(lof.scores, decreasing = TRUE)
+
+# Creamos un gráfico con los scores LOF
+plot(lof.scores[indices.ordenados], main='LOF Scores', ylab='LOF Score', xlab='Observation Index')
+```
+
+En un análisis LOF, los puntos con scores más altos son considerados más atípicos en relación con su vecindario local. En este gráfico, la mayoría de las observaciones parecen tener scores de LOF cercanos a 1, lo que sugiere que son bastante típicos o similares a sus vecinos en términos de densidad. Sin embargo, hay algunos valores que se destacan con scores más altos, especialmente los primeros puntos en el gráfico, que tienen los valores de LOF más altos y, por lo tanto, se consideran los outliers más pronunciados dentro del conjunto de datos.
+
+El punto con el LOF score más alto, que supera un valor de 2, se destaca significativamente de los demás, lo cual es un indicativo de que su comportamiento es muy diferente del de los otros puntos en su entorno local. Con ese valor y los otros dos, se puede observar que esos 5 primeros valores distan más del resto, por lo que vamos a proceder a analizarlos más en detalle.
+
+```{r}
+num.outliers <- 5
+
+claves.outliers.lof <- indices.ordenados[1:num.outliers]
+
+nombres.outliers.lof <- nombres_filas(PimaIndiansDiabetes2.num.norm, claves.outliers.lof)
+
+```
+
+```{r echo=FALSE}
+claves.outliers.lof
+
+nombres.outliers.lof
+```
+
+```{r echo=FALSE}
+PimaIndiansDiabetes2.num.norm[claves.outliers.lof, ]
+
+```
+
+Los outliers identificados en este conjunto de datos, al ser examinados detalladamente, revelan perfiles interesantes: mientras algunos individuos presentan valores extremadamente altos o bajos en variables aisladas, no todos son casos de desviaciones extremas en una única variable. Por ejemplo, aunque el individuo **446** tiene una presión sanguínea notablemente baja y una masa corporal alta, no se observan valores extremos que sobresalgan en una sola variable.Esto sugiere que la puntuación LOF elevada puede deberse a una combinación inusual de múltiples factores en lugar de una anomalía aislada. En particular, el alto factor de predisposición genética (`pedigree`) en los tres casos puede estar contribuyendo significativamente a su clasificación como outliers.
+
+La ausencia de valores extremadamente desviados en una sola métrica sugiere que la detección de outliers, en este caso, es más sutil y posiblemente más informada por la interacción de varias características que por variaciones extremas en una sola.
+
+Con esto, vamos a ver las interacciones de cada par de variables para observar las interacciones entre ellas. Para ello, mostramos los diagramas de dispersión de cada par de variables.
+
+```{r echo=FALSE}
+clave.max.outlier.lof = claves.outliers.lof[1]
+
+colores = rep("black", times = nrow(PimaIndiansDiabetes2.num.norm))
+colores[clave.max.outlier.lof] = "red"
+pairs(PimaIndiansDiabetes2.num.norm, pch = 19,  cex = 0.5, col = colores, lower.panel = NULL)
+```
+
+A primera vista, lo que se puede observar es que los valores LOF maximos si que cuadran con valores atípicos de la variable pedigree como hemos comentado anteriormente. Aunque es verdad que no se ve una correlación clara entre las variables, pero si se observa que, por ejemplo entre `mass` y `triceps` parece que hay una correlación más directa.
+
+Por otro lado, en términos de densidad de puntos, ciertas regiones del gráfico muestran una mayor concentración de observaciones, mientras que otras áreas presentan una dispersión baja. Por ejemplo, puntos que caen en regiones de baja densidad pero cercanos a regiones de alta densidad pueden ser marcados como outliers debido a la discrepancia en la densidad local.
+
+Para observar esto de una manera más clara, vamos a usar el gráfico biplot, que a diferencia de los gráficos de dispersión, muestra el comportamiento entre todas las variables.
+
+```{r echo=FALSE}
+biplot.max.outlier.lof = biplot_2_colores(PimaIndiansDiabetes2.num.norm, clave.max.outlier.lof, titulo = "Mayor outlier LOF")
+biplot.max.outlier.lof
+```
+
+En este caso, se observa como el maximo outlier, se da en un extremo muy extremo de los datos, en una zona de muy baja densidad. Esto lo que significa es que existe una combinación de características muy diferente al resto, como se observa en los análisis anteriores.
+
+## **Métodos basados Clustering**
+
+Aquí, se van a analizar otro método basado en distancias que sería el de Clustering. Miraremos los outliers en base a la distancia de cada dato con su centroide.
+
+### **Clustering usando k-means**
+
+```{r echo=FALSE}
+num.outliers = 5
+num.clusters = 3
+set.seed(2)
+```
+
+Calculamos los centroides y los clusters. En este caso, hemos realizado una primera aproximación de num.outliers basada en la aproximación de métodos anteriores obteniendo el mismo.
+
+```{r}
+modelo.kmeans = kmeans(PimaIndiansDiabetes2.num.norm, centers = num.clusters)
+
+asignac.clust = modelo.kmeans$cluster
+
+centroides.normalizados = modelo.kmeans$centers
+
+
+```
+
+Mostramos la asignación del cluster y los centroides normalizados.
+
+```{r}
+head(asignac.clust)
+
+
+centroides.normalizados
+```
+
+Aquí vemos como se representan los centroides sin normalizar.
+
+```{r echo=FALSE}
+centroides.desnormalizados = desnormaliza(PimaIndiansDiabetes2.num, centroides.normalizados)
+centroides.desnormalizados
+```
+
+Generamos la función para obtener el top de los ouliers del clustering.
+
+```{r}
+top_clustering_outliers = function(datos.normalizados, asignaciones.clustering, datos.centroides.normalizados, num.outliers) {
+
+  distancias = distancias_a_centroides(datos.normalizados, asignaciones.clustering,
+                                       datos.centroides.normalizados)
+  
+  claves = order(distancias, decreasing = TRUE)[1:num.outliers]
+  
+  return(list(distancias = distancias[claves], claves = claves))
+}
+
+```
+
+```{r}
+
+num.outliers = nrow(PimaIndiansDiabetes2.num.norm)
+resultados = top_clustering_outliers(PimaIndiansDiabetes2.num.norm, 
+                                     asignac.clust, 
+                                     centroides.normalizados, 
+                                     num.outliers)
+
+distancias_ordenadas = sort(resultados$distancias, decreasing = TRUE)
+plot(distancias_ordenadas, type = 'b', pch = 1, xlab = "Índice del dato", ylab = "Distancia al centroide", main = "Distancias de los datos a sus centroides")
+
+```
+
+Con esta gráfica, podemos observar que elegir 5 outliers como se han elegido anteriormente es coherente ya que están bastante alejadas del resto. Y así, podemos comparar con los datos obtenidos del método LOF.
+
+```{r}
+num.outliers = 5
+resultados = top_clustering_outliers(PimaIndiansDiabetes2.num.norm, 
+                                     asignac.clust, 
+                                     centroides.normalizados, 
+                                     num.outliers)
+```
+
+Para ello, vamos a generar un biplot con la información de los outliers y clusters.
+
+```{r echo=FALSE}
+biplot_outliers_clustering(PimaIndiansDiabetes2.num, 
+                           titulo = "Outliers k-means",
+                           asignaciones.clustering = asignac.clust,
+                           claves.outliers = resultados$claves)
+```
+
+En este caso, es posible apreciar que 3 de los 5 outliers detectados están en el exterior de lo que sería la nube principal de puntos. Esto nos indica que se hayan visto como outliers debido a que es posible que en una o variables variables tengan valores muy altos.
+
+Además observamos otros 2 outliers no tan separados, lo que indica que estos es probable que se hayan fijado en varias columnas para detectarlos, entre ellos el valor 5 que ya aparecia anteriormente en el análisis.
+
+Para poder completar este análisis, vamos a generar el diagrama de cajas.
+
+```{r echo=FALSE}
+diag_caja_juntos(PimaIndiansDiabetes2.num, "Outliers k-means",resultados$claves)
+
+```
+
+Con este diagrama se aprecia que para el valor **5** detectado como outlier, solo se aprecia como que 1 variable la tiene muy alta y, por tanto, la detecta como tal, pero el resto las tiene dentro de lo normal. En cuanto a los demás, se observa como hay varios que tienen varias variables muy altas como es el valor **446**.
+
+Lo que si que se puede apreciar es que la variable `pedigree` conjuntamente con la de `insulin` son las variables que más peso tienen para definir outliers, definiendo en la mayoria de los casos, casos muy altos en dichas variables. Esto se debe a que, como hemos comentado anteriormente, estas variables son muy importantes a la hora de detectar diabetes y van muy relacionadas, por lo que estos valores extremos es posible que se den por casos muy claros de diabetes.
+
+## **Análisis de los outliers multivariantes puros**
+
+Como observamos, existen valores de outliers que pueden ser detectados como tal, no solo por una variable extrema, sino por un conjunto de variables no tan extremas, que sumadas hacen un valor atípico. En este caso, como podemos observar, como con la variable 371, es posible decir que no solo es por una única variable.
+
+Para ello vamos a generar la detección de outliers multivariantes puros.
+
+```{r}
+
+claves.outliers.lof.no.IQR <- setdiff(claves.outliers.lof, claves.outliers.IQR.en.alguna.columna)
+
+nombres.outliers.lof.no.IQR <- nombres_filas(PimaIndiansDiabetes2.num, claves.outliers.lof.no.IQR)
+
+
+```
+
+```{r echo=FALSE}
+claves.outliers.IQR.en.alguna.columna
+
+claves.outliers.lof
+
+claves.outliers.lof.no.IQR
+
+nombres.outliers.lof.no.IQR
+```
+
+En este dataset y como se puede observar, no existen outliers puros. Esto es debido a que los outliers que se detectan son por variables que tienen valores extremos (aunque tengan este tipo de valores en varios datos de sus variables).
+
+```{r}
+num.outliers <- 15
+
+claves.outliers.lof <- indices.ordenados[1:num.outliers]
+
+nombres.outliers.lof <- nombres_filas(PimaIndiansDiabetes2.num.norm, claves.outliers.lof)
+
+```
+
+```{r}
+
+claves.outliers.lof.no.IQR <- setdiff(claves.outliers.lof, claves.outliers.IQR.en.alguna.columna)
+
+nombres.outliers.lof.no.IQR <- nombres_filas(PimaIndiansDiabetes2.num, claves.outliers.lof.no.IQR)
+
+claves.outliers.IQR.en.alguna.columna
+
+claves.outliers.lof
+
+claves.outliers.lof.no.IQR
+
+nombres.outliers.lof.no.IQR
+```
+
+# **Resumen final**
+
+## **Metodología**
+
+**Objetivo.** El objetivo del trabajo ha sido detectar outliers en un conjunto de datos. Hemos supuesto que los datos son correctos, por lo que la intención no ha sido el detectar errores en la toma de datos sino encontrar datos interesantes por salirse de lo normal. Para ello, se han utilizado técnicas 1-variantes (técnicas para encontrar datos con valores extremos con respecto a una única variable) y técnicas multivariantes (para encontrar datos con combinaciones anómalas de dos o más variables).
+
+**Preparación de datos.** Se ha procedido a seleccionar únicamente las variables numéricas. En el caso de que hubiese habido valores nulos o perdidos, habría que eliminar los registros correspondientes o aplicar un procedimiento de imputación de valores (siempre que tenga sentido) También se han eliminado aquellas variables que tenían muy pocos valores distintos. En las técnicas que así lo requieren, se ha procedido a una normalización de los datos por el método z-score.
+
+**Procedimientos aplicados.** En el caso 1-variante hemos aplicado las siguientes técnicas:
+
+-   **Método IQR.** Es un método heurístico que, en el caso de que los datos sigan una distribución Normal, tiene una base estadística. Para distribuciones que no sean demasiado raras, el método proporciona información sobre aquellos registros que tienen valores (en una variable) alejados de su media.
+
+-   **Visualización**. Para visualizar los valores de los outliers en una variable hemos usado diagramas de cajas. Si queremos comparar de forma conjunta los diagramas de cajas de varias variables tendremos que usar, obligatoriamente, los datos normalizados. También hemos usado un biplot para ver los valores que toman los outliers en todas las variables (no sólo en aquellas en las que son outliers) No hemos de olvidar que un biplot no ofrece una información exacta sino aproximada ya que reduce a 2 dimensiones la información proporcionada por m dimensiones.
+
+Una vez hemos analizado los outliers en una única variable, hemos procedido a analizar los outliers multivariantes. Hemos usado las siguientes técnicas:
+
+-   **Métodos estadísticos**. Al igual que en el caso 1-variante, son métodos cuyo objetivo es dar garantía estadística al etiquetar un valor como outlier. De la misma forma, requieren que la distribución subyacente sea una Normal multivariante.
+
+-   **Métodos basados en densidad.** Estos métodos se basan en la aplicación de una medida de distancia entre los datos y dan como resultado un score o puntuación de outlier para cada uno de los datos. Para que las diferentes magnitudes de las variables no influyan en el resultado, debemos normalizar previamente los datos. El método que hemos aplicado es LOF (Local Outlier Factor) que tiene en cuenta las densidades de las nubes de puntos correspondientes a los datos.
+
+-   **Métodos basados en clustering.** Estos métodos se basan en la construcción previa de un número de clusters. El número de clusters habrá que fijarlo si así lo exige el método, como por ejemplo k-means. Una vez construidos los clusters, los outliers serán aquellos valores que más se alejan del centroide del cluster al que pertenecen.
+
+-   En el último apartado hemos intentado detectar los **outliers multivariantes puros**. Un dato con un valor muy extremo en una única variable puede ser etiquetado como un outlier multivariante, simplemente porque dicha variable aporta mucho en el cómputo global. Estos outliers no resultan muy interesantes desde el punto de vista multivariante. Por otra parte, podemos tener registros que no hayan sido etiquetados como outliers en ninguna variable, pero sin embargo tienen valores bastante extremos en varias variables. Este tipo de outliers son más interesantes porque detectan datos que se salen de lo normal en varios aspectos (sin tener que ser los que más sobresalen en un único aspecto).
+
+## **Análisis de resultados**
+
+### **Conjunto de datos**
+
+Hemos trabajado con la base de datos `pima` eliminando las variables no numéricas. Al final nos hemos quedado con las siguientes columnas: `pregnant`, `glucose`, `pressure`, `triceps`, `insulin`, `mass`, `pedigree`, `age` .
+
+Se ha aplicado la normalización `z-score` en todas las variables seleccionadas para los métodos que se ha necesitado.
+
+### **Outliers en una variable**
+
+-   **Método IQR**
+
+En cuanto a los outliers encontrados a través de este método, se han encontrado 6 outliers no extremos, lo que significa que se alejan de la media más de 1.5 veces la distancia del intercuartil, de los cuales 1 es extremo, lo que significa que se aleja más de 3 veces.
+
+Con ellos, hemos podido observar analizando la variable `mass` que la mayoria no solo eran outliers en esta variable, sino que en otras como `insuline`, `pedigree` o `triceps` tambien se replicaban esos datos atípicos.
+
+Por otro lado, ha sido importante analizar que `age` no tiene casi influencia en estos datos.
+
+### **Outliers multivariantes**
+
+-   **Visualización con biplot**
+
+En cuanto a la visualización de biplot, se ha observado que se representa un porcentaje relevante de explicados aunque no es demasiado alto (19.5+32 = 51.5). Entendemos que es buena la visualización obtenida, pero debido a que se representa más de la mitad.
+
+-   **LOF**
+
+El punto con el LOF score más alto, que supera un valor de 2, se destaca significativamente de los demás, lo cual es un indicativo de que su comportamiento es muy diferente del de los otros puntos en su entorno local. Con ese valor y los otros dos, se puede observar que esos 5 primeros valores distan más del resto, por lo que vamos a proceder a analizarlos más en detalle.
+
+Los outliers anteriores identificados, por ejemplo, el individuo 446 tiene una presión sanguínea notablemente baja y una masa corporal alta, pero no se observan valores extremos que sobresalgan en una sola variable. Esto sugiere que la puntuación LOF elevada puede deberse a una combinación inusual de múltiples factores en lugar de una anomalía aislada. En particular, el alto factor de predisposición genética (`pedigree`) en los tres casos puede estar contribuyendo significativamente a su clasificación como outliers.
+
+Lo que se ha observado es que los valores LOF maximos si que cuadran con valores atípicos de la variable `pedigree` como hemos comentado anteriormente. Aunque es verdad que no se ve una correlación clara entre las variables, pero si se observa que, por ejemplo entre mass y triceps parece que hay una correlación más directa.
+
+Por otro lado, en términos de densidad de puntos, se ha vsto que ciertas regiones del gráfico muestran una mayor concentración de observaciones, mientras que otras áreas presentan una dispersión baja.
+
+-   **Métodos basados en clustering**
+
+Con el método de k-means (ordenando outliers según la distancia euclídea a los centroides) hemos detectado como outliers como el valor 5 detectado como outlier, solo se aprecia como que 1 variable la tiene muy alta y, por tanto, la detecta como tal, pero el resto las tiene dentro de lo normal. En cuanto a los demás outliers, se observa como hay varios que tienen varias variables muy altas como es el valor 446.
+
+Lo que si que se puede apreciar es que la variable `pedigree` conjuntamente con la de `insulin` son las variables que más peso tienen para definir outliers, definiendo en la mayoria de los casos, casos muy altos en dichas variables.
+
+Esto se debe a que, como hemos comentado anteriormente, estas variables son muy importantes a la hora de detectar diabetes y van muy relacionadas, por lo que estos valores extremos es posible que se den por casos muy claros de diabetes.
+
+-   **Outliers multivariantes puros**
+
+Se han aplicado métodos para obtenerlos, pero en el dataset no se han encontrado ningun outlier multivariante puro.
